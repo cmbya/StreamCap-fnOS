@@ -4,7 +4,7 @@
 
 - 上游：ihmily/StreamCap
 - 不使用 Docker
-- GitHub Actions 每 6 小时检查一次上游最新正式 Release
+- GitHub Actions 每 24 小时检查一次上游最新正式 Release
 - 检测到新版本后自动生成 `.fpk` 和 `SHA256SUMS.txt`
 - 自动创建 GitHub **Pre-release**，方便先在飞牛上测试
 
