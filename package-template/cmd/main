@@ -1,0 +1,123 @@
+#!/bin/bash
+set -u
+RUNTIME="${TRIM_PKGVAR}/native-runtime"
+SOURCE="$RUNTIME/source"
+VENV="$RUNTIME/venv"
+PID_FILE="${TRIM_PKGVAR}/streamcap.pid"
+LOG_FILE="${TRIM_PKGVAR}/streamcap.log"
+PORT="${TRIM_SERVICE_PORT:-6006}"
+DEFAULT_DOWNLOADS="${TRIM_DATA_SHARE_PATHS%%:*}"
+PATH_FILE="${TRIM_PKGETC}/recording_path.conf"
+
+recording_path() {
+  local p=""
+  if [ -s "$PATH_FILE" ]; then
+    IFS= read -r p < "$PATH_FILE" || true
+  fi
+  if [ -z "$p" ] && [ -n "${TRIM_DATA_ACCESSIBLE_PATHS:-}" ]; then
+    p="${TRIM_DATA_ACCESSIBLE_PATHS%%:*}"
+  fi
+  if [ -z "$p" ]; then
+    p="$DEFAULT_DOWNLOADS"
+  fi
+  printf '%s' "$p"
+}
+
+DOWNLOADS="$(recording_path)"
+
+export PATH="$RUNTIME/ffmpeg/bin:/var/apps/python312/target/bin:/var/apps/nodejs_v22/target/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+export PLATFORM=web
+export HOST=0.0.0.0
+export PORT
+export TZ=Asia/Shanghai
+export PYTHONUNBUFFERED=1
+
+is_running() {
+  if [ -f "$PID_FILE" ]; then
+    pid="$(head -n 1 "$PID_FILE" | tr -d '[:space:]')"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    rm -f "$PID_FILE"
+  fi
+  return 1
+}
+
+repair_download_link() {
+  [ -n "$DOWNLOADS" ] || return 1
+  mkdir -p "$DOWNLOADS" || return 1
+
+  if [ -L "$SOURCE/downloads" ]; then
+    current="$(readlink "$SOURCE/downloads" 2>/dev/null || true)"
+    if [ "$current" != "$DOWNLOADS" ]; then
+      rm -f "$SOURCE/downloads"
+      ln -s "$DOWNLOADS" "$SOURCE/downloads"
+    fi
+  elif [ -e "$SOURCE/downloads" ]; then
+    # Never delete a non-empty real directory. This protects recordings if an
+    # older/manual installation created downloads as a normal folder.
+    if [ -d "$SOURCE/downloads" ] && [ -z "$(ls -A "$SOURCE/downloads" 2>/dev/null)" ]; then
+      rmdir "$SOURCE/downloads"
+      ln -s "$DOWNLOADS" "$SOURCE/downloads"
+    fi
+  else
+    ln -s "$DOWNLOADS" "$SOURCE/downloads"
+  fi
+}
+
+start_app() {
+  if is_running; then
+    return 0
+  fi
+  if [ ! -x "$VENV/bin/python" ] || [ ! -f "$SOURCE/main.py" ]; then
+    echo "StreamCap 原生运行环境不存在或不完整，请重新安装/升级应用。" > "${TRIM_TEMP_LOGFILE}"
+    return 1
+  fi
+  if ! repair_download_link; then
+    echo "录像目录不可用：${DOWNLOADS}。请在 StreamCap 应用设置中重新选择授权目录。" > "${TRIM_TEMP_LOGFILE}"
+    return 1
+  fi
+
+  cd "$SOURCE" || return 1
+  echo "$(date '+%F %T') starting StreamCap native on port $PORT; recordings=$DOWNLOADS" >> "$LOG_FILE"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$VENV/bin/python" main.py --web --host 0.0.0.0 --port "$PORT" >> "$LOG_FILE" 2>&1 &
+  else
+    "$VENV/bin/python" main.py --web --host 0.0.0.0 --port "$PORT" >> "$LOG_FILE" 2>&1 &
+  fi
+  pid=$!
+  echo "$pid" > "$PID_FILE"
+  sleep 2
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$PID_FILE"
+    echo "StreamCap 启动失败，请查看 ${LOG_FILE}。" > "${TRIM_TEMP_LOGFILE}"
+    return 1
+  fi
+  return 0
+}
+
+stop_app() {
+  if ! is_running; then
+    return 0
+  fi
+  pid="$(head -n 1 "$PID_FILE" | tr -d '[:space:]')"
+  echo "$(date '+%F %T') stopping StreamCap native" >> "$LOG_FILE"
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  n=0
+  while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 20 ]; do
+    sleep 1
+    n=$((n + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+  return 0
+}
+
+case "${1:-}" in
+  start) start_app ;;
+  stop) stop_app ;;
+  status) if is_running; then exit 0; else exit 3; fi ;;
+  *) echo "Unknown command: ${1:-}" > "${TRIM_TEMP_LOGFILE}"; exit 1 ;;
+esac
