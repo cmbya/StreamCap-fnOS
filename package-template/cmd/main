@@ -77,10 +77,16 @@ source = Path(sys.argv[1]).resolve()
 utils_path = source / "app/utils/utils.py"
 record_manager_path = source / "app/core/recording/record_manager.py"
 stream_manager_path = source / "app/core/recording/stream_manager.py"
+recording_card_path = source / "app/ui/components/business/recording_card.py"
 
-for path in (utils_path, record_manager_path, stream_manager_path):
+for path in (
+    utils_path,
+    record_manager_path,
+    stream_manager_path,
+    recording_card_path,
+):
     if not path.is_file():
-        raise SystemExit(f"[fnOS native3] missing upstream file: {path}")
+        raise SystemExit(f"[fnOS native4] missing upstream file: {path}")
 
 
 def write_if_changed(path: Path, old: str, new: str) -> None:
@@ -215,6 +221,203 @@ if has_fnos_clock and schedule_marker not in text:
         )
 
 write_if_changed(record_manager_path, old_text, text)
+
+
+# ================================================================
+# 2.5) native4：每日定时窗口切换时自动重新布防。
+# ================================================================
+text = record_manager_path.read_text(encoding="utf-8")
+old_text = text
+
+native4_schedule_marker = "# fnOS native4: scheduled window transition re-arm"
+
+if native4_schedule_marker not in text:
+    start = text.find("    async def check_all_live_status(self):")
+    end = text.find("    _periodic_task_running = False", start)
+
+    if start < 0 or end < 0:
+        print(
+            "[fnOS native4] WARN: check_all_live_status changed upstream; "
+            "skip schedule transition patch",
+            flush=True,
+        )
+    else:
+        replacement = """    async def check_all_live_status(self):
+        # fnOS native4: scheduled window transition re-arm
+        for recording in self.recordings:
+            if not recording.monitor_status or recording.is_recording:
+                continue
+
+            if recording.scheduled_recording:
+                scheduled_time_range_list = await self.get_scheduled_time_range(
+                    recording.scheduled_start_time,
+                    recording.monitor_hours,
+                ) or []
+
+                in_scheduled = any(
+                    utils.is_current_time_within_range(time_range)
+                    for time_range in scheduled_time_range_list
+                )
+
+                previous_in_scheduled = getattr(
+                    recording,
+                    "_fnos_native4_in_scheduled",
+                    None,
+                )
+
+                if in_scheduled and previous_in_scheduled is not True:
+                    setattr(
+                        recording,
+                        "_fnos_native4_in_scheduled",
+                        True,
+                    )
+                    recording.detection_time = None
+                    recording.showed_checking_status = False
+
+                    logger.info(
+                        "[fnOS native4 schedule] "
+                        f"ENTER window url={recording.url} "
+                        f"now={utils.fnos_now().strftime('%Y-%m-%d %H:%M:%S')} "
+                        f"ranges={scheduled_time_range_list}; "
+                        "trigger immediate live check"
+                    )
+
+                    self.app.page.run_task(
+                        self.check_if_live,
+                        recording,
+                    )
+                    continue
+
+                if not in_scheduled:
+                    if previous_in_scheduled is not False:
+                        logger.info(
+                            "[fnOS native4 schedule] "
+                            f"OUTSIDE window url={recording.url} "
+                            f"now={utils.fnos_now().strftime('%Y-%m-%d %H:%M:%S')} "
+                            f"ranges={scheduled_time_range_list}"
+                        )
+
+                    setattr(
+                        recording,
+                        "_fnos_native4_in_scheduled",
+                        False,
+                    )
+
+                    if (
+                        recording.status_info
+                        != RecordingStatus.NOT_IN_SCHEDULED_CHECK
+                    ):
+                        recording.status_info = (
+                            RecordingStatus.NOT_IN_SCHEDULED_CHECK
+                        )
+                        recording.is_live = False
+                        recording.is_checking = False
+                        self.app.page.run_task(
+                            self.app.record_card_manager.update_card,
+                            recording,
+                        )
+
+                    continue
+
+            is_exceeded = utils.is_time_interval_exceeded(
+                recording.detection_time,
+                recording.loop_time_seconds,
+            )
+
+            if not recording.detection_time or is_exceeded:
+                self.app.page.run_task(
+                    self.check_if_live,
+                    recording,
+                )
+
+"""
+        text = text[:start] + replacement + text[end:]
+
+# 有每日定时监听任务时，每 60 秒检查一次是否跨入定时窗口。
+# 实际平台请求仍由 check_all_live_status 的 loop_time 控制。
+if "# fnOS native4: dynamic scheduled polling interval" not in text:
+    old_sleep = """                if immediate_check_on_startup:
+                    await asyncio.sleep(interval)
+"""
+    new_sleep = """                # fnOS native4: dynamic scheduled polling interval
+                if immediate_check_on_startup:
+                    has_scheduled_monitor = any(
+                        rec.monitor_status and rec.scheduled_recording
+                        for rec in self.recordings
+                    )
+                    await asyncio.sleep(
+                        min(interval, 60)
+                        if has_scheduled_monitor
+                        else interval
+                    )
+"""
+
+    if old_sleep in text:
+        text = text.replace(old_sleep, new_sleep, 1)
+    else:
+        print(
+            "[fnOS native4] WARN: periodic sleep block changed upstream",
+            flush=True,
+        )
+
+write_if_changed(record_manager_path, old_text, text)
+
+
+# ================================================================
+# 2.6) native4：编辑保存定时配置后立即重新布防。
+# ================================================================
+text = recording_card_path.read_text(encoding="utf-8")
+old_text = text
+
+native4_edit_marker = "# fnOS native4: re-arm after scheduled settings edit"
+
+if native4_edit_marker not in text:
+    needle = """        recording.scheduled_time_range = await self.app.record_manager.get_scheduled_time_range(
+            recording.scheduled_start_time, recording.monitor_hours
+        )
+
+        await self.update_card(recording)
+"""
+
+    replacement = """        recording.scheduled_time_range = await self.app.record_manager.get_scheduled_time_range(
+            recording.scheduled_start_time, recording.monitor_hours
+        )
+
+        # fnOS native4: re-arm after scheduled settings edit
+        if recording.monitor_status and recording.scheduled_recording:
+            recording.detection_time = None
+            recording.showed_checking_status = False
+            setattr(
+                recording,
+                "_fnos_native4_in_scheduled",
+                None,
+            )
+
+            logger.info(
+                "[fnOS native4 schedule] "
+                f"schedule edited; re-arm url={recording.url} "
+                f"start={recording.scheduled_start_time} "
+                f"hours={recording.monitor_hours}"
+            )
+
+            self.app.page.run_task(
+                self.app.record_manager.check_if_live,
+                recording,
+            )
+
+        await self.update_card(recording)
+"""
+
+    if needle in text:
+        text = text.replace(needle, replacement, 1)
+    else:
+        print(
+            "[fnOS native4] WARN: edit_recording_callback changed upstream; "
+            "skip edit re-arm patch",
+            flush=True,
+        )
+
+write_if_changed(recording_card_path, old_text, text)
 
 
 # ================================================================
@@ -357,17 +560,22 @@ if "# fnOS native3: a non-safe FFmpeg exit" not in text:
 
 write_if_changed(stream_manager_path, old_text, text)
 
-for path in (utils_path, record_manager_path, stream_manager_path):
+for path in (
+    utils_path,
+    record_manager_path,
+    stream_manager_path,
+    recording_card_path,
+):
     py_compile.compile(str(path), doraise=True)
 
-print("[fnOS native3] runtime patch verified", flush=True)
+print("[fnOS native4] runtime patch verified", flush=True)
 PY
 }
 
 log_runtime_clock() {
   {
     echo "============================================================"
-    echo "$(date '+%F %T') [fnOS native3] runtime diagnostics"
+    echo "$(date '+%F %T') [fnOS native4] runtime diagnostics"
     echo "shell TZ=${TZ:-}"
     echo "shell date=$(date '+%F %T %z %Z' 2>/dev/null || date)"
     echo "ffmpeg=$(command -v ffmpeg 2>/dev/null || echo missing)"
@@ -412,16 +620,16 @@ start_app() {
 
   cd "$SOURCE" || return 1
 
-  echo "$(date '+%F %T') applying StreamCap fnOS native3 runtime patch" >> "$LOG_FILE"
+  echo "$(date '+%F %T') applying StreamCap fnOS native4 runtime patch" >> "$LOG_FILE"
 
   if ! apply_native3_patch >> "$LOG_FILE" 2>&1; then
-    echo "StreamCap native3 运行补丁失败，请查看 ${LOG_FILE}。" > "${TRIM_TEMP_LOGFILE}"
+    echo "StreamCap native4 运行补丁失败，请查看 ${LOG_FILE}。" > "${TRIM_TEMP_LOGFILE}"
     return 1
   fi
 
   log_runtime_clock
 
-  echo "$(date '+%F %T') starting StreamCap native3 on port $PORT; recordings=$DOWNLOADS" >> "$LOG_FILE"
+  echo "$(date '+%F %T') starting StreamCap native4 on port $PORT; recordings=$DOWNLOADS" >> "$LOG_FILE"
 
   if command -v setsid >/dev/null 2>&1; then
     setsid "$VENV/bin/python" main.py --web --host 0.0.0.0 --port "$PORT" >> "$LOG_FILE" 2>&1 &
@@ -448,7 +656,7 @@ stop_app() {
   fi
 
   pid="$(head -n 1 "$PID_FILE" | tr -d '[:space:]')"
-  echo "$(date '+%F %T') stopping StreamCap native3" >> "$LOG_FILE"
+  echo "$(date '+%F %T') stopping StreamCap native4" >> "$LOG_FILE"
 
   kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
 
