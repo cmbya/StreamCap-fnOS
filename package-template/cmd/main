@@ -78,12 +78,14 @@ utils_path = source / "app/utils/utils.py"
 record_manager_path = source / "app/core/recording/record_manager.py"
 stream_manager_path = source / "app/core/recording/stream_manager.py"
 recording_card_path = source / "app/ui/components/business/recording_card.py"
+main_py_path = source / "main.py"
 
 for path in (
     utils_path,
     record_manager_path,
     stream_manager_path,
     recording_card_path,
+    main_py_path,
 ):
     if not path.is_file():
         raise SystemExit(f"[fnOS native4] missing upstream file: {path}")
@@ -421,6 +423,220 @@ write_if_changed(recording_card_path, old_text, text)
 
 
 # ================================================================
+# 2.7) native5：修复 Web 模式周期任务绑定第一浏览器会话的问题。
+#
+# v1.0.3:
+# - main.py 只在第一个 web session 启动 periodic tasks；
+# - RecordingManager 用 class bool 标记“已经启动”；
+# - 周期 loop 没有异常自恢复；
+# - 后续刷新/重连不会把 scheduler 重新绑定到最新 App/Page。
+#
+# native5:
+# - 每次 Web 会话 load 都调用 start_periodic_tasks；
+# - setup_periodic_live_check 幂等：
+#   * 活着 -> 只 rebind 到最新 RecordingManager；
+#   * 已死 -> 自动重建；
+# - loop 每轮异常不会导致整个 scheduler 永久死亡。
+# ================================================================
+
+# ---- main.py：每个 web session 都重新绑定 scheduler ----
+text = main_py_path.read_text(encoding="utf-8")
+old_text = text
+
+native5_main_marker = "# fnOS native5: always rebind web scheduler"
+
+if native5_main_marker not in text:
+    old_block = """        if page.web:
+            global global_state
+            if not global_state.periodic_tasks_started:
+                global_state.periodic_tasks_started = True
+                logger.info("Starting periodic tasks for the first time in web mode")
+                page.run_task(app.start_periodic_tasks)
+            else:
+                logger.info("Periodic tasks already running in web mode, skipping initialization")
+        else:
+"""
+
+    new_block = """        if page.web:
+            # fnOS native5: always rebind web scheduler
+            logger.info(
+                "[fnOS native5 scheduler] "
+                "bind/rebind periodic scheduler to current web session"
+            )
+            page.run_task(app.start_periodic_tasks)
+        else:
+"""
+
+    if old_block in text:
+        text = text.replace(old_block, new_block, 1)
+    else:
+        print(
+            "[fnOS native5] WARN: main.py web periodic block changed upstream",
+            flush=True,
+        )
+
+write_if_changed(main_py_path, old_text, text)
+
+
+# ---- RecordingManager：真实 task handle + rebind + watchdog ----
+text = record_manager_path.read_text(encoding="utf-8")
+old_text = text
+
+native5_scheduler_marker = "# fnOS native5: resilient web scheduler"
+
+if native5_scheduler_marker not in text:
+    start = text.find("    _periodic_task_running = False")
+    end = text.find("    async def check_if_live(self, recording: Recording):", start)
+
+    if start < 0 or end < 0:
+        print(
+            "[fnOS native5] WARN: periodic scheduler block changed upstream",
+            flush=True,
+        )
+    else:
+        replacement = """    # fnOS native5: resilient web scheduler
+    _periodic_task_running = False
+    _periodic_task = None
+    _periodic_manager = None
+
+    @classmethod
+    def is_periodic_task_running(cls):
+        task = getattr(cls, "_periodic_task", None)
+        return bool(task is not None and not task.done())
+
+    @classmethod
+    def set_periodic_task_running(cls, value=True):
+        cls._periodic_task_running = value
+
+    async def setup_periodic_live_check(self, interval: int = 180):
+        # Always point the global scheduler at the newest Web App/RecordingManager.
+        RecordingManager._periodic_manager = self
+
+        current_task = getattr(
+            RecordingManager,
+            "_periodic_task",
+            None,
+        )
+
+        if current_task is not None and not current_task.done():
+            RecordingManager._periodic_task_running = True
+            self.periodic_task_started = True
+            logger.info(
+                "[fnOS native5 scheduler] "
+                "scheduler alive; rebound to latest web session"
+            )
+            return
+
+        async def periodic_check():
+            logger.info(
+                "[fnOS native5 scheduler] "
+                "persistent periodic scheduler started"
+            )
+
+            RecordingManager._periodic_task_running = True
+
+            try:
+                while True:
+                    manager = (
+                        RecordingManager._periodic_manager
+                        or self
+                    )
+
+                    try:
+                        has_scheduled_monitor = any(
+                            rec.monitor_status
+                            and rec.scheduled_recording
+                            for rec in manager.recordings
+                        )
+
+                        sleep_seconds = (
+                            min(interval, 30)
+                            if has_scheduled_monitor
+                            else interval
+                        )
+
+                        immediate_check_on_startup = (
+                            manager.app.settings.user_config.get(
+                                "check_live_on_browser_refresh",
+                                True,
+                            )
+                        )
+
+                        if immediate_check_on_startup:
+                            await asyncio.sleep(sleep_seconds)
+
+                        await manager.check_free_space()
+
+                        if manager.app.recording_enabled:
+                            await manager.check_all_live_status()
+
+                        if not immediate_check_on_startup:
+                            await asyncio.sleep(sleep_seconds)
+
+                    except asyncio.CancelledError:
+                        raise
+
+                    except Exception as exc:
+                        # Never let one stale/disconnected Flet page
+                        # permanently kill the NAS scheduler.
+                        logger.exception(
+                            "[fnOS native5 scheduler] "
+                            f"periodic cycle failed but scheduler stays alive: {exc}"
+                        )
+                        await asyncio.sleep(10)
+
+            finally:
+                RecordingManager._periodic_task_running = False
+                RecordingManager._periodic_task = None
+                logger.warning(
+                    "[fnOS native5 scheduler] "
+                    "periodic scheduler stopped"
+                )
+
+        task = asyncio.create_task(periodic_check())
+
+        RecordingManager._periodic_task = task
+        RecordingManager._periodic_task_running = True
+        self.periodic_task_started = True
+
+        logger.info(
+            "[fnOS native5 scheduler] "
+            f"new scheduler task created: {id(task)}"
+        )
+
+"""
+        text = text[:start] + replacement + text[end:]
+
+# native4 check_all 里由 scheduler 触发 check_if_live 时，
+# 不再经由旧 page.run_task 包一层，直接在服务端事件循环启动。
+text = text.replace(
+    """                    self.app.page.run_task(
+                        self.check_if_live,
+                        recording,
+                    )
+""",
+    """                    asyncio.create_task(
+                        self.check_if_live(recording)
+                    )
+""",
+)
+
+text = text.replace(
+    """                self.app.page.run_task(
+                    self.check_if_live,
+                    recording,
+                )
+""",
+    """                asyncio.create_task(
+                    self.check_if_live(recording)
+                )
+""",
+)
+
+write_if_changed(record_manager_path, old_text, text)
+
+
+# ================================================================
 # 3) FFmpeg 异常后快速刷新直播源，并增加详细 stderr 日志。
 # ================================================================
 text = stream_manager_path.read_text(encoding="utf-8")
@@ -565,17 +781,18 @@ for path in (
     record_manager_path,
     stream_manager_path,
     recording_card_path,
+    main_py_path,
 ):
     py_compile.compile(str(path), doraise=True)
 
-print("[fnOS native4] runtime patch verified", flush=True)
+print("[fnOS native5] runtime patch verified", flush=True)
 PY
 }
 
 log_runtime_clock() {
   {
     echo "============================================================"
-    echo "$(date '+%F %T') [fnOS native4] runtime diagnostics"
+    echo "$(date '+%F %T') [fnOS native5] runtime diagnostics"
     echo "shell TZ=${TZ:-}"
     echo "shell date=$(date '+%F %T %z %Z' 2>/dev/null || date)"
     echo "ffmpeg=$(command -v ffmpeg 2>/dev/null || echo missing)"
@@ -620,16 +837,16 @@ start_app() {
 
   cd "$SOURCE" || return 1
 
-  echo "$(date '+%F %T') applying StreamCap fnOS native4 runtime patch" >> "$LOG_FILE"
+  echo "$(date '+%F %T') applying StreamCap fnOS native5 runtime patch" >> "$LOG_FILE"
 
   if ! apply_native3_patch >> "$LOG_FILE" 2>&1; then
-    echo "StreamCap native4 运行补丁失败，请查看 ${LOG_FILE}。" > "${TRIM_TEMP_LOGFILE}"
+    echo "StreamCap native5 运行补丁失败，请查看 ${LOG_FILE}。" > "${TRIM_TEMP_LOGFILE}"
     return 1
   fi
 
   log_runtime_clock
 
-  echo "$(date '+%F %T') starting StreamCap native4 on port $PORT; recordings=$DOWNLOADS" >> "$LOG_FILE"
+  echo "$(date '+%F %T') starting StreamCap native5 on port $PORT; recordings=$DOWNLOADS" >> "$LOG_FILE"
 
   if command -v setsid >/dev/null 2>&1; then
     setsid "$VENV/bin/python" main.py --web --host 0.0.0.0 --port "$PORT" >> "$LOG_FILE" 2>&1 &
@@ -656,7 +873,7 @@ stop_app() {
   fi
 
   pid="$(head -n 1 "$PID_FILE" | tr -d '[:space:]')"
-  echo "$(date '+%F %T') stopping StreamCap native4" >> "$LOG_FILE"
+  echo "$(date '+%F %T') stopping StreamCap native5" >> "$LOG_FILE"
 
   kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
 
