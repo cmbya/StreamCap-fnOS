@@ -31,27 +31,70 @@ jobs:
 
           if [ -n "${MANUAL_VERSION:-}" ]; then
             TAG="$MANUAL_VERSION"
+
             case "$TAG" in
               v*) ;;
               *) TAG="v$TAG" ;;
             esac
+
+            echo "手动指定上游版本: $TAG"
           else
-            TAG="$(python3 - <<'PY'
-          import json
-          import urllib.request
+            echo "自动获取 StreamCap 最新正式 Release..."
 
-          req = urllib.request.Request(
-              'https://api.github.com/repos/ihmily/StreamCap/releases/latest',
-              headers={
-                  'Accept': 'application/vnd.github+json',
-                  'User-Agent': 'StreamCap-fnOS-builder'
-              }
-          )
+            # 不再请求 api.github.com。
+            # GitHub Actions 共享出口 IP 很容易碰到
+            # 未认证 REST API 的 60 次/小时限制。
+            set +e
 
-          with urllib.request.urlopen(req, timeout=30) as r:
-              print(json.load(r)['tag_name'])
-          PY
-          )"
+            LATEST_URL="$(
+              curl \
+                --fail \
+                --silent \
+                --show-error \
+                --location \
+                --retry 4 \
+                --retry-delay 3 \
+                --retry-all-errors \
+                --connect-timeout 15 \
+                --max-time 90 \
+                --output /dev/null \
+                --write-out '%{url_effective}' \
+                'https://github.com/ihmily/StreamCap/releases/latest'
+            )"
+
+            CURL_EXIT=$?
+
+            set -e
+
+            if [ "$CURL_EXIT" -eq 0 ] && \
+               [[ "$LATEST_URL" == */releases/tag/* ]]; then
+
+              TAG="${LATEST_URL##*/}"
+              echo "✅ 从 GitHub Release 跳转取得最新版本: $TAG"
+            else
+              echo "⚠️ Release 网页获取失败，改用 Git Tags 兜底"
+
+              # 只接受 v数字.数字.数字 的正式版，
+              # 自动排除 beta / rc / prerelease。
+              TAG="$(
+                git ls-remote \
+                  --tags \
+                  --refs \
+                  https://github.com/ihmily/StreamCap.git \
+                | awk '{print $2}' \
+                | sed 's#refs/tags/##' \
+                | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V \
+                | tail -n 1
+              )"
+
+              if [ -z "$TAG" ]; then
+                echo "❌ 无法取得 StreamCap 最新正式版本"
+                exit 1
+              fi
+
+              echo "✅ 从 Git Tags 取得最新正式版本: $TAG"
+            fi
           fi
 
           VERSION="${TAG#v}"
@@ -84,22 +127,23 @@ jobs:
         env:
           TAG: ${{ steps.version.outputs.tag }}
         run: |
-          python3 - <<'PY'
-          import os
-          import urllib.request
+          set -euo pipefail
 
-          tag = os.environ['TAG']
-          url = f'https://github.com/ihmily/StreamCap/archive/refs/tags/{tag}.tar.gz'
+          echo "验证上游 Tag: $TAG"
 
-          req = urllib.request.Request(
-              url,
-              method='HEAD',
-              headers={'User-Agent':'StreamCap-fnOS-builder'}
-          )
+          if git ls-remote \
+            --exit-code \
+            --tags \
+            --refs \
+            https://github.com/ihmily/StreamCap.git \
+            "refs/tags/$TAG" \
+            >/dev/null; then
 
-          with urllib.request.urlopen(req, timeout=30) as r:
-              print('上游源码标签可用:', tag, r.status)
-          PY
+            echo "✅ 上游源码标签可用: $TAG"
+          else
+            echo "❌ 上游不存在 Tag: $TAG"
+            exit 1
+          fi
 
       - name: 构建 x86 FPK
         if: steps.existing.outputs.exists != 'true'
