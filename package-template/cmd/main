@@ -5,7 +5,6 @@ RUNTIME="${TRIM_PKGVAR}/native-runtime"
 SOURCE="$RUNTIME/source"
 VENV="$RUNTIME/venv"
 PID_FILE="${TRIM_PKGVAR}/streamcap.pid"
-LOG_FILE="${TRIM_PKGVAR}/streamcap.log"
 PORT="${TRIM_SERVICE_PORT:-6006}"
 DEFAULT_DOWNLOADS="${TRIM_DATA_SHARE_PATHS%%:*}"
 PATH_FILE="${TRIM_PKGETC}/recording_path.conf"
@@ -25,6 +24,12 @@ recording_path() {
 }
 
 DOWNLOADS="$(recording_path)"
+
+# fnOS native6:
+# 将日志放到已授权的录像目录，用户可以直接用飞牛文件管理器查看。
+LOG_DIR="${DOWNLOADS}/StreamCap-Logs"
+LOG_FILE="${LOG_DIR}/streamcap-fnos.log"
+LOG_OLD="${LOG_FILE}.1"
 
 export PATH="$RUNTIME/ffmpeg/bin:/var/apps/python312/target/bin:/var/apps/nodejs_v22/target/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 export PLATFORM=web
@@ -47,6 +52,16 @@ is_running() {
 repair_download_link() {
   [ -n "$DOWNLOADS" ] || return 1
   mkdir -p "$DOWNLOADS" || return 1
+  mkdir -p "$LOG_DIR" || return 1
+
+  # fnOS native6: 日志超过 10 MiB 时保留一份旧日志，避免无限增长。
+  if [ -f "$LOG_FILE" ]; then
+    LOG_SIZE="$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)"
+    if [ "${LOG_SIZE:-0}" -ge 10485760 ]; then
+      rm -f "$LOG_OLD"
+      mv "$LOG_FILE" "$LOG_OLD"
+    fi
+  fi
 
   if [ -L "$SOURCE/downloads" ]; then
     current="$(readlink "$SOURCE/downloads" 2>/dev/null || true)"
@@ -792,7 +807,7 @@ PY
 log_runtime_clock() {
   {
     echo "============================================================"
-    echo "$(date '+%F %T') [fnOS native5] runtime diagnostics"
+    echo "$(date '+%F %T') [fnOS native6] runtime diagnostics"
     echo "shell TZ=${TZ:-}"
     echo "shell date=$(date '+%F %T %z %Z' 2>/dev/null || date)"
     echo "ffmpeg=$(command -v ffmpeg 2>/dev/null || echo missing)"
@@ -837,16 +852,17 @@ start_app() {
 
   cd "$SOURCE" || return 1
 
-  echo "$(date '+%F %T') applying StreamCap fnOS native5 runtime patch" >> "$LOG_FILE"
+  echo "$(date '+%F %T') applying StreamCap fnOS native6 runtime patch" >> "$LOG_FILE"
 
   if ! apply_native3_patch >> "$LOG_FILE" 2>&1; then
-    echo "StreamCap native5 运行补丁失败，请查看 ${LOG_FILE}。" > "${TRIM_TEMP_LOGFILE}"
+    echo "StreamCap native6 运行补丁失败，请查看 ${LOG_FILE}。" > "${TRIM_TEMP_LOGFILE}"
     return 1
   fi
 
   log_runtime_clock
 
-  echo "$(date '+%F %T') starting StreamCap native5 on port $PORT; recordings=$DOWNLOADS" >> "$LOG_FILE"
+  echo "$(date '+%F %T') [fnOS native6] visible_log=$LOG_FILE" >> "$LOG_FILE"
+  echo "$(date '+%F %T') starting StreamCap native6 on port $PORT; recordings=$DOWNLOADS" >> "$LOG_FILE"
 
   if command -v setsid >/dev/null 2>&1; then
     setsid "$VENV/bin/python" main.py --web --host 0.0.0.0 --port "$PORT" >> "$LOG_FILE" 2>&1 &
@@ -873,7 +889,7 @@ stop_app() {
   fi
 
   pid="$(head -n 1 "$PID_FILE" | tr -d '[:space:]')"
-  echo "$(date '+%F %T') stopping StreamCap native5" >> "$LOG_FILE"
+  echo "$(date '+%F %T') stopping StreamCap native6" >> "$LOG_FILE"
 
   kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
 
