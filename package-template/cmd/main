@@ -25,7 +25,7 @@ recording_path() {
 
 DOWNLOADS="$(recording_path)"
 
-# fnOS native6:
+# fnOS native7:
 # 将日志放到已授权的录像目录，用户可以直接用飞牛文件管理器查看。
 LOG_DIR="${DOWNLOADS}/StreamCap-Logs"
 LOG_FILE="${LOG_DIR}/streamcap-fnos.log"
@@ -54,7 +54,7 @@ repair_download_link() {
   mkdir -p "$DOWNLOADS" || return 1
   mkdir -p "$LOG_DIR" || return 1
 
-  # fnOS native6: 日志超过 10 MiB 时保留一份旧日志，避免无限增长。
+  # fnOS native7: 日志超过 10 MiB 时保留一份旧日志，避免无限增长。
   if [ -f "$LOG_FILE" ]; then
     LOG_SIZE="$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)"
     if [ "${LOG_SIZE:-0}" -ge 10485760 ]; then
@@ -85,6 +85,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import py_compile
+import re
 import sys
 
 source = Path(sys.argv[1]).resolve()
@@ -652,6 +653,372 @@ write_if_changed(record_manager_path, old_text, text)
 
 
 # ================================================================
+# 2.8) native7：定时窗口拥有“真正的录制生命周期”。
+#
+# native6 剩余问题：
+# - check_all_live_status 一开始遇到 recording.is_recording 就 continue，
+#   所以跨出定时窗口时不会真正停止 FFmpeg；
+# - Web/Flet 会话断开后，check_if_live 可能已经执行 start_update()，
+#   但 recorder.start_recording 仍通过 page.run_task 启动。
+#   这会造成：is_recording=True，但 active_recorders 为空、目录没有文件；
+# - stream_manager 内部启动 FFmpeg / direct downloader 也依赖 page.run_task。
+#
+# native7：
+# - 定时窗口先于 is_recording 判断；
+# - EXIT 时主动 stop_recording(..., manually_stopped=False)；
+# - ENTER/窗口内检查 fake state：is_recording=True 但 active recorder 不存在；
+# - 真正录制链路全部改为 asyncio.create_task，不依赖浏览器 WebSocket；
+# - 清理残留 force_stop，避免下一次到点后刚启动就被旧停止标志杀掉。
+# ================================================================
+
+# ---- RecordingManager: server-side start_recording dispatch ----
+text = record_manager_path.read_text(encoding="utf-8")
+old_text = text
+
+native7_dispatch_marker = "# fnOS native7: server-side recorder dispatch"
+
+if native7_dispatch_marker not in text:
+    patterns = [
+        (
+            re.compile(
+                r'(?P<i>[ \t]+)self\.start_update\(recording\)\n'
+                r'(?P=i)self\.app\.page\.run_task\(\n'
+                r'(?P=i)    recorder\.start_recording,\n'
+                r'(?P=i)    stream_info,\n'
+                r'(?P=i)\)',
+                re.M,
+            ),
+            lambda m: (
+                f"{m.group('i')}self.start_update(recording)\n"
+                f"{m.group('i')}# fnOS native7: server-side recorder dispatch\n"
+                f"{m.group('i')}recording.force_stop = False\n"
+                f"{m.group('i')}recording.manually_stopped = False\n"
+                f"{m.group('i')}logger.info(\n"
+                f"{m.group('i')}    '[fnOS native7 recorder] dispatch start_recording ' \n"
+                f"{m.group('i')}    f'rec_id={{recording.rec_id}} url={{recording.url}}'\n"
+                f"{m.group('i')})\n"
+                f"{m.group('i')}asyncio.create_task(\n"
+                f"{m.group('i')}    recorder.start_recording(stream_info)\n"
+                f"{m.group('i')})"
+            ),
+        ),
+        (
+            re.compile(
+                r'(?P<i>[ \t]+)self\.start_update\(recording\)\n'
+                r'(?P=i)self\.app\.page\.run_task\('
+                r'recorder\.start_recording,\s*stream_info\)',
+                re.M,
+            ),
+            lambda m: (
+                f"{m.group('i')}self.start_update(recording)\n"
+                f"{m.group('i')}# fnOS native7: server-side recorder dispatch\n"
+                f"{m.group('i')}recording.force_stop = False\n"
+                f"{m.group('i')}recording.manually_stopped = False\n"
+                f"{m.group('i')}logger.info(\n"
+                f"{m.group('i')}    '[fnOS native7 recorder] dispatch start_recording ' \n"
+                f"{m.group('i')}    f'rec_id={{recording.rec_id}} url={{recording.url}}'\n"
+                f"{m.group('i')})\n"
+                f"{m.group('i')}asyncio.create_task(\n"
+                f"{m.group('i')}    recorder.start_recording(stream_info)\n"
+                f"{m.group('i')})"
+            ),
+        ),
+    ]
+
+    replaced = 0
+    for pattern, repl in patterns:
+        text, count = pattern.subn(repl, text, count=1)
+        if count:
+            replaced += count
+            break
+
+    if replaced != 1:
+        raise SystemExit(
+            "[fnOS native7] ERROR: cannot replace recorder.start_recording page.run_task"
+        )
+
+write_if_changed(record_manager_path, old_text, text)
+
+
+# ---- RecordingManager: scheduled recording lifecycle ----
+text = record_manager_path.read_text(encoding="utf-8")
+old_text = text
+
+native7_schedule_marker = "# fnOS native7: scheduled recording lifecycle"
+
+if native7_schedule_marker not in text:
+    start = text.find("    async def check_all_live_status(self):")
+    end = text.find("    # fnOS native5: resilient web scheduler", start)
+
+    if end < 0:
+        end = text.find("    _periodic_task_running = False", start)
+
+    if start < 0 or end < 0:
+        raise SystemExit(
+            "[fnOS native7] ERROR: cannot locate check_all_live_status boundary"
+        )
+
+    replacement = '''    async def check_all_live_status(self):
+        # fnOS native7: scheduled recording lifecycle
+        for recording in self.recordings:
+            if not recording.monitor_status:
+                continue
+
+            active = recording.rec_id in self.active_recorders
+
+            if recording.scheduled_recording:
+                scheduled_time_range_list = await self.get_scheduled_time_range(
+                    recording.scheduled_start_time,
+                    recording.monitor_hours,
+                ) or []
+
+                in_scheduled = any(
+                    utils.is_current_time_within_range(time_range)
+                    for time_range in scheduled_time_range_list
+                )
+
+                previous_in_scheduled = getattr(
+                    recording,
+                    "_fnos_native7_in_scheduled",
+                    None,
+                )
+
+                # 离开时间窗：定时规则必须真正停止正在运行的 recorder。
+                if not in_scheduled:
+                    if previous_in_scheduled is not False:
+                        logger.info(
+                            "[fnOS native7 schedule] "
+                            f"EXIT/OUTSIDE url={recording.url} "
+                            f"now={utils.fnos_now().strftime('%Y-%m-%d %H:%M:%S')} "
+                            f"ranges={scheduled_time_range_list} "
+                            f"is_recording={recording.is_recording} active={active}"
+                        )
+
+                    setattr(
+                        recording,
+                        "_fnos_native7_in_scheduled",
+                        False,
+                    )
+
+                    if active or recording.is_recording:
+                        if active and not recording.is_recording:
+                            # active_recorders 是真实录制的最终依据。
+                            recording.is_recording = True
+
+                        if active:
+                            logger.info(
+                                "[fnOS native7 schedule] REAL STOP "
+                                f"rec_id={recording.rec_id} url={recording.url}"
+                            )
+                            self.stop_recording(
+                                recording,
+                                manually_stopped=False,
+                            )
+                        else:
+                            # native6 可能留下假的 is_recording=True。
+                            logger.warning(
+                                "[fnOS native7 schedule] FAKE STATE outside window; "
+                                f"reset rec_id={recording.rec_id} url={recording.url}"
+                            )
+                            recording.is_recording = False
+                            recording.start_time = None
+                            recording.stopping_in_progress = False
+                            recording.manually_stopped = False
+
+                    # 没有真实 recorder 时，不得残留 force_stop=True。
+                    if not active:
+                        recording.force_stop = False
+
+                    recording.is_live = False
+                    recording.is_checking = False
+                    recording.status_info = (
+                        RecordingStatus.NOT_IN_SCHEDULED_CHECK
+                    )
+                    continue
+
+                # 进入/位于时间窗内。
+                entered = previous_in_scheduled is not True
+
+                if entered:
+                    setattr(
+                        recording,
+                        "_fnos_native7_in_scheduled",
+                        True,
+                    )
+                    recording.detection_time = None
+                    recording.showed_checking_status = False
+                    logger.info(
+                        "[fnOS native7 schedule] ENTER window "
+                        f"url={recording.url} "
+                        f"now={utils.fnos_now().strftime('%Y-%m-%d %H:%M:%S')} "
+                        f"ranges={scheduled_time_range_list} "
+                        f"is_recording={recording.is_recording} active={active}"
+                    )
+
+                # 旧 force_stop 只能属于上一场/旧 fake state。
+                if not active and recording.force_stop:
+                    logger.warning(
+                        "[fnOS native7 schedule] clear stale force_stop "
+                        f"rec_id={recording.rec_id} url={recording.url}"
+                    )
+                    recording.force_stop = False
+
+                # UI 可能已变成“录制中”，但真正 recorder 没建立。
+                if recording.is_recording and not active:
+                    logger.warning(
+                        "[fnOS native7 schedule] FAKE STATE detected; "
+                        f"is_recording=True but active recorder missing; "
+                        f"reset and retry rec_id={recording.rec_id} url={recording.url}"
+                    )
+                    recording.is_recording = False
+                    recording.is_live = False
+                    recording.start_time = None
+                    recording.stopping_in_progress = False
+                    recording.manually_stopped = False
+                    recording.force_stop = False
+                    recording.detection_time = None
+                    active = False
+
+                if active:
+                    if not recording.is_recording:
+                        logger.warning(
+                            "[fnOS native7 schedule] active recorder exists but "
+                            "is_recording=False; reconcile state "
+                            f"rec_id={recording.rec_id}"
+                        )
+                        recording.is_recording = True
+                    continue
+
+                is_exceeded = utils.is_time_interval_exceeded(
+                    recording.detection_time,
+                    recording.loop_time_seconds,
+                )
+
+                if entered or not recording.detection_time or is_exceeded:
+                    logger.info(
+                        "[fnOS native7 schedule] CHECK "
+                        f"rec_id={recording.rec_id} url={recording.url} "
+                        f"entered={entered}"
+                    )
+                    asyncio.create_task(
+                        self.check_if_live(recording)
+                    )
+                continue
+
+            # 非定时监听继续保留上游行为。
+            if recording.is_recording or active:
+                continue
+
+            is_exceeded = utils.is_time_interval_exceeded(
+                recording.detection_time,
+                recording.loop_time_seconds,
+            )
+
+            if not recording.detection_time or is_exceeded:
+                asyncio.create_task(
+                    self.check_if_live(recording)
+                )
+
+'''
+
+    text = text[:start] + replacement + text[end:]
+
+write_if_changed(record_manager_path, old_text, text)
+
+
+# ---- Stream manager: detach recording engine from Flet page/WebSocket ----
+text = stream_manager_path.read_text(encoding="utf-8")
+old_text = text
+
+native7_stream_marker = "# fnOS native7: server-side recording engine"
+
+if native7_stream_marker not in text:
+    # Persist recording_dir without requiring a live Flet page.
+    old_persist = "self.app.page.run_task(self.app.record_manager.persist_recordings)"
+    if old_persist in text:
+        text = text.replace(
+            old_persist,
+            "asyncio.create_task(self.app.record_manager.persist_recordings())",
+            1,
+        )
+
+    direct_old = '''            self.app.page.run_task(
+                self.start_direct_download,
+                stream_info.anchor_name,
+                self.live_url,
+                record_url,
+                save_path,
+                self.save_format,
+                self.user_config.get("custom_script_command"),
+            )'''
+
+    direct_new = '''            # fnOS native7: server-side recording engine
+            logger.info(
+                "[fnOS native7 recorder] dispatch direct downloader "
+                f"rec_id={self.recording.rec_id} save_path={save_path}"
+            )
+            asyncio.create_task(
+                self.start_direct_download(
+                    stream_info.anchor_name,
+                    self.live_url,
+                    record_url,
+                    save_path,
+                    self.save_format,
+                    self.user_config.get("custom_script_command"),
+                )
+            )'''
+
+    if direct_old in text:
+        text = text.replace(direct_old, direct_new, 1)
+
+    ffmpeg_old = '''            self.app.page.run_task(
+                self.start_ffmpeg,
+                stream_info.anchor_name,
+                self.live_url,
+                record_url,
+                ffmpeg_command,
+                self.save_format,
+                self.user_config.get("custom_script_command"),
+            )'''
+
+    ffmpeg_new = '''            # fnOS native7: server-side recording engine
+            logger.info(
+                "[fnOS native7 recorder] dispatch ffmpeg "
+                f"rec_id={self.recording.rec_id} save_path={save_path}"
+            )
+            asyncio.create_task(
+                self.start_ffmpeg(
+                    stream_info.anchor_name,
+                    self.live_url,
+                    record_url,
+                    ffmpeg_command,
+                    self.save_format,
+                    self.user_config.get("custom_script_command"),
+                )
+            )'''
+
+    if ffmpeg_old in text:
+        text = text.replace(ffmpeg_old, ffmpeg_new, 1)
+
+    # native3 recovery used page.run_task; keep recovery alive after browser close.
+    recovery_old = '''            self.app.page.run_task(
+                self.app.record_manager.check_if_live,
+                self.recording,
+            )'''
+    recovery_new = '''            asyncio.create_task(
+                self.app.record_manager.check_if_live(self.recording)
+            )'''
+    text = text.replace(recovery_old, recovery_new)
+
+    if native7_stream_marker not in text:
+        raise SystemExit(
+            "[fnOS native7] ERROR: cannot detach stream engine from page.run_task"
+        )
+
+write_if_changed(stream_manager_path, old_text, text)
+
+
+# ================================================================
 # 3) FFmpeg 异常后快速刷新直播源，并增加详细 stderr 日志。
 # ================================================================
 text = stream_manager_path.read_text(encoding="utf-8")
@@ -800,14 +1167,14 @@ for path in (
 ):
     py_compile.compile(str(path), doraise=True)
 
-print("[fnOS native5] runtime patch verified", flush=True)
+print("[fnOS native7] runtime patch verified", flush=True)
 PY
 }
 
 log_runtime_clock() {
   {
     echo "============================================================"
-    echo "$(date '+%F %T') [fnOS native6] runtime diagnostics"
+    echo "$(date '+%F %T') [fnOS native7] runtime diagnostics"
     echo "shell TZ=${TZ:-}"
     echo "shell date=$(date '+%F %T %z %Z' 2>/dev/null || date)"
     echo "ffmpeg=$(command -v ffmpeg 2>/dev/null || echo missing)"
@@ -852,17 +1219,17 @@ start_app() {
 
   cd "$SOURCE" || return 1
 
-  echo "$(date '+%F %T') applying StreamCap fnOS native6 runtime patch" >> "$LOG_FILE"
+  echo "$(date '+%F %T') applying StreamCap fnOS native7 runtime patch" >> "$LOG_FILE"
 
   if ! apply_native3_patch >> "$LOG_FILE" 2>&1; then
-    echo "StreamCap native6 运行补丁失败，请查看 ${LOG_FILE}。" > "${TRIM_TEMP_LOGFILE}"
+    echo "StreamCap native7 运行补丁失败，请查看 ${LOG_FILE}。" > "${TRIM_TEMP_LOGFILE}"
     return 1
   fi
 
   log_runtime_clock
 
-  echo "$(date '+%F %T') [fnOS native6] visible_log=$LOG_FILE" >> "$LOG_FILE"
-  echo "$(date '+%F %T') starting StreamCap native6 on port $PORT; recordings=$DOWNLOADS" >> "$LOG_FILE"
+  echo "$(date '+%F %T') [fnOS native7] visible_log=$LOG_FILE" >> "$LOG_FILE"
+  echo "$(date '+%F %T') starting StreamCap native7 on port $PORT; recordings=$DOWNLOADS" >> "$LOG_FILE"
 
   if command -v setsid >/dev/null 2>&1; then
     setsid "$VENV/bin/python" main.py --web --host 0.0.0.0 --port "$PORT" >> "$LOG_FILE" 2>&1 &
@@ -889,7 +1256,7 @@ stop_app() {
   fi
 
   pid="$(head -n 1 "$PID_FILE" | tr -d '[:space:]')"
-  echo "$(date '+%F %T') stopping StreamCap native6" >> "$LOG_FILE"
+  echo "$(date '+%F %T') stopping StreamCap native7" >> "$LOG_FILE"
 
   kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
 
