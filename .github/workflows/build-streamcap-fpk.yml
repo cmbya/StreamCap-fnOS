@@ -22,6 +22,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: 验证 native7 定时录制生命周期补丁
+        run: |
+          set -euo pipefail
+          python3 scripts/validate_native7_patch.py
+
       - name: 获取目标版本
         id: version
         env:
