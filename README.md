@@ -16,12 +16,12 @@ GitHub 仓库 → Actions → `Build StreamCap fnOS FPK` → `Run workflow`。
 
 也可以填写指定版本，例如：`v1.0.3`。
 
-## 修改飞牛封装版本
-
-`PACK_REV` 当前为 `native2`。
-
-如果以后修改了 fnOS 打包逻辑，请将它改成 `native3`、`native4`……，这样同一个 StreamCap 上游版本也能重新生成一个新的 Release。
-
 ## 注意
 
 自动“打包成功”不等于上游新版本一定与旧 fnOS 封装完全兼容。上游如果改变启动参数、配置文件结构或依赖方式，仍可能需要修改 `package-template/`。因此默认生成 Pre-release，而不是直接标记为正式版。
+
+## 上游版本与旧包迁移
+
+新 FPK 的 manifest、文件名和 Release tag 直接使用上游版本 `1.0.3`，不再添加封装修订号。同一个上游版本只发布一次，不能静默替换同版本 FPK。
+
+FnDepot 先前索引的版本为 `1.0.307`。已安装的旧包可能因版本号比较或安装来源无法自动升级；切换版本规则需要在设备上单独验证和迁移。
