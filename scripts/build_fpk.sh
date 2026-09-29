@@ -15,59 +15,14 @@ fi
 VERSION="${TAG#v}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PACK_REV="$(tr -d '[:space:]' < "$ROOT/PACK_REV")"
-
-[[ -n "$PACK_REV" ]] || {
-  echo "PACK_REV 为空" >&2
-  exit 2
-}
-
-# ================================================================
-# fnOS manifest 版本必须保持纯 X.Y.Z。
-#
-# 旧版错误写法：
-#   1.0.3-native2
-#   1.0.3-native3
-#
-# fnOS 可能会把两者都按 1.0.3 判断，
-# 导致“已安装相同或更高版本”。
-#
-# native3 修正版映射：
-#   上游 1.0.3 + native3 -> 1.0.303
-#   上游 1.0.3 + native4 -> 1.0.304
-#   上游 1.0.4 + native1 -> 1.0.401
-#
-# 规则：
-#   fnOS patch = 上游 patch * 100 + native 序号
-# ================================================================
-
-if [[ ! "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "上游版本必须是 X.Y.Z，当前：$VERSION" >&2
   exit 2
 fi
-
-UP_MAJOR="${BASH_REMATCH[1]}"
-UP_MINOR="${BASH_REMATCH[2]}"
-UP_PATCH="${BASH_REMATCH[3]}"
-
-if [[ ! "$PACK_REV" =~ ^native([0-9]+)$ ]]; then
-  echo "PACK_REV 必须是 native数字，例如 native3；当前：$PACK_REV" >&2
-  exit 2
-fi
-
-PACK_SEQ="${BASH_REMATCH[1]}"
-
-if (( 10#$PACK_SEQ >= 100 )); then
-  echo "native 序号必须小于 100；当前：$PACK_SEQ" >&2
-  exit 2
-fi
-
-FNOS_PATCH=$((10#$UP_PATCH * 100 + 10#$PACK_SEQ))
-FNOS_VERSION="${UP_MAJOR}.${UP_MINOR}.${FNOS_PATCH}"
+FNOS_VERSION="$VERSION"
 
 echo "======================================"
 echo "StreamCap 上游版本 : $VERSION"
-echo "fnOS 封装修订     : $PACK_REV"
 echo "fnOS manifest版本 : $FNOS_VERSION"
 echo "======================================"
 
@@ -114,20 +69,18 @@ p.write_text(s, encoding="utf-8")
 PY
 
 # 2) 更新 fnOS manifest。
-#    注意：version 只能写纯 X.Y.Z 的 FNOS_VERSION，
-#    native3 等修订号只放在 changelog / 文件名 / Release Tag。
+#    version 直接使用上游的 X.Y.Z。
 python3 \
   - "$PKG/manifest" \
   "$FNOS_VERSION" \
   "$VERSION" \
-  "$PACK_REV" \
   "$TAG" <<'PY'
 from pathlib import Path
 import sys
 
 p = Path(sys.argv[1])
 
-fnos_version, upstream_version, pack_rev, tag = sys.argv[2:]
+fnos_version, upstream_version, tag = sys.argv[2:]
 
 lines = p.read_text(
     encoding="utf-8"
@@ -137,7 +90,7 @@ replace = {
     "version": fnos_version,
     "changelog": (
         f"自动跟随上游 StreamCap {tag} 构建；"
-        f"fnOS 原生 x86 封装 {pack_rev}；"
+        "fnOS 原生 x86 封装；"
         f"fnOS 包版本 {fnos_version}。"
         "保留持久化配置、录像目录和无损升级逻辑。"
     ),
@@ -259,9 +212,8 @@ echo "✅ manifest version 合法：$MANIFEST_VERSION"
 
 # 5) 生成 .fpk
 #
-# 文件名仍然保留“上游版本 + native修订”，
-# 方便人在 GitHub Release 中识别。
-OUT="$DIST/StreamCap_${VERSION}_${PACK_REV}_fnOS_x86.fpk"
+# 文件名使用上游版本。
+OUT="$DIST/StreamCap_${VERSION}_fnOS_x86.fpk"
 
 tar -czf "$OUT" -C "$PKG" .
 
@@ -308,6 +260,5 @@ echo
 echo "======================================"
 printf '构建成功: %s\n' "$OUT"
 printf '上游版本: %s\n' "$VERSION"
-printf '封装修订: %s\n' "$PACK_REV"
 printf 'fnOS安装版本: %s\n' "$FNOS_VERSION"
 echo "======================================"
